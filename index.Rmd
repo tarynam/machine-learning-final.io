@@ -1,0 +1,219 @@
+---
+title: "Machine Learning Final Project"
+author: "Taryn McLaughlin"
+date: "10/6/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message= FALSE, warning = TRUE, error = TRUE)
+```
+
+```{r load data, warning = FALSE}
+setwd("/home/user/datasciencecoursera")
+train<-read.csv("pml-training.csv")
+test<-read.csv("pml-testing.csv")
+```
+
+##Pre-processing the Training Data Set
+
+The training data set is quite large with `r dim(train)[1]` observations of `r dim(train)[2]` variables. If we were to include all variables in our prediction models, the computation time would be extremely long, so we will want to inspect our data set and try to prune it if possible.
+
+###Missing Data
+```{r missing values}
+library(dplyr)
+library(knitr)
+NA_data<-data.frame(sapply(train, function(x){sum(is.na(x))}))
+blank_data<-data.frame(sapply(train, function(x){sum(x=="")}))
+missing_data<-data.frame(cbind(NA_data, blank_data))
+missing_data$variable<-row.names(missing_data)
+missing_data<-dplyr::rename(missing_data, N.A = sapply.train..function.x..., 
+                            Blank = sapply.train..function.x....1)%>%
+    filter(N.A>0|Blank>0)%>%
+    select(variable, N.A, Blank)
+kable(head(missing_data, 8))
+```
+
+There are `r length(missing_data$variable)` variables with `r missing_data[1,3]` missing values (arising from NA values or blank cells) which can interfere with models such as random forest. As such, we will trim the training data set to only include variables which have a complete set of observations.
+
+```{r}
+train_noNA<-train[ , colSums(is.na(train)) == 0] #sum up the number of NAs in each column
+#create new data table that includes only those columns where the sum is equal to zero
+train_complete<-train_noNA[ , colSums(train_noNA == "") == 0]
+```
+
+###Zero and Near Zero Variance
+When building models, we need to be concerned about zero variance and near zero variance predictors. These can skew models and make them unstable, particularly when cross-validation is used. Here we generate the Frequency Ratio and the Percent Unique Values. The first is the ratio of the frequency of the most common value to the second most common value for a feature- this should be close to 1 for well balanced predictors. The second is the number of unique values divided by the total number of entries x100- this will be close to 100 when there are numerous unique predictors and close to 0 when there are only a few. 
+
+```{r zero and near zero variance}
+library(caret)
+library(dplyr)
+library(knitr)
+#Identify the relevant measurements to detect  for each variable
+nz<-nearZeroVar(train_complete, saveMetrics= TRUE)
+nz<-dplyr::arrange(nz, desc(freqRatio))
+kable(head(nz))
+```
+
+Features that have a high value in the Frequency Ratio (i.e. one value dominates that feature) and a low value in the Percent Unique Values (i.e. there are a lot of different values) have near-zero variance. We have `r length(which(nz$nzv))` variables that fit this definition so we do not need to pre-process to account for this.
+
+###Correlated Variables
+To determine whether any variables are highly correlated with one another, and by extension determine whether we should reduce the dimensions of our data with pre-processing, I have calculated the correlation matrix for all numeric variables in the data set.
+
+```{r correlation}
+numeric.only <- function(X,...){
+    a<-sapply(X, class)
+    return(X[a =="numeric"|a=="integer"])}
+numbers<-numeric.only(train_complete)
+descrCor <-  cor(numbers)
+heatmap(descrCor)
+```
+
+There seem to be a few variables correlated with one another as indicated by the lighter colored boxes in the grid. There are `r length(which(abs(descrCor[lower.tri(descrCor, diag = FALSE)])>0.8))` variable pairs that have more than 80% correlation with one another out of `r length(descrCor[lower.tri(descrCor, diag = FALSE)])` variable pairs. Since this is a small proportion, we will not pre-process the data to account for these.
+###Variable Selection
+Since the "X" variable is just an index indicator and is non-informative, we will remove it from the data set.
+```{r}
+library(dplyr)
+train_complete<-dplyr::select(train_complete, -X)
+```
+
+Due to model performance, I will also preemptively subset my data such that y is the outcome variable to use in model training later, x is a table of all complete predictors and x2 is a table of complete predictors that contain only numeric values.
+
+```{r}
+library(dplyr)
+y<-train_complete$classe
+x<-select(train_complete, -classe)
+x2<-x[sapply(x, class) != "factor"]
+```
+
+
+##Training Models
+
+###Training methods
+We now specify our training method for all model specifications. We will do 10-fold cross validation to evaluate and improve our models, with no repeats to improve performance time. We will also allow for parallel processing to improve performance time.
+
+```{r, eval = TRUE}
+library(caret)
+fitControl <- trainControl(## 5-fold CV
+    method = "cv", #cv: cross validation
+    number = 10, #the number of folds
+    allowParallel = TRUE
+    )
+nnetGrid <-  expand.grid(size = seq(from = 1, to = 10, by = 1),
+                        decay = seq(from = 0.1, to = 0.5, by = 0.1))
+```
+
+###K-nearest Neighbors
+Models built using K-nearest Neighbors essentially map all training data points to a "feature space." To classify new data points, the K nearest training points in the feature spaced are assessed for their categories and a majority wins. So if K is 5 and 3 of the 5 closest points in space are A, the new point is assigned the outcome A.
+```{r K nearest neighbors,  cache=TRUE}
+library(knitr)
+library(caret)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+set.seed(825)
+fit_knn <- train(x2,y,
+                  method="knn",
+                  trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+###Support Vector Machine
+Support Vector machines also map training data points to a "feature space" and finds a plane that cleanly divides the data between two categories with the most buffer room. New data is then mapped into the model space and categorized based on which side of the plane it falls. It can be expanded to account for more than two outcome categories. It requires non-categorical training features.
+```{r support vector machines,  cache=TRUE}
+library(knitr)
+library(caret)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+set.seed(825)
+fit_svm <- train(x2,y,
+                  method="svmLinear",
+                  trControl = fitControl, 
+                  verbose=FALSE)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+###Neural Networks
+Neural Networks take training data to create a set of "neurons" which take input data, execute some sort of mathematical function on that data, weight the output of the function. The output from each "neuron" is then collected to assign the input data to an outcome value.
+```{r nnet,  cache=TRUE, message = TRUE}
+library(knitr)
+library(caret)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+set.seed(825)
+fit_nnet <- train(x,y,
+                  method="nnet",
+                  trControl = fitControl, 
+                  tuneGrid = nnetGrid,
+                  verbose=FALSE)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+###Random Forest
+Random Forest models are essentially bagged tree models. Tree based methods repeatedly divide training data based on features that can distinguish between categories. The sequential divisions essentially form decision "trees" wherein you can take new data with the same features and predict what category it belongs to. Random Forest is an ensemble method wherein many random "trees" are created and combined together to form the random forest used for prediction. Because factor variables can become problematic during the prediction stage using Random Forest, we will use the numeric only set of predictors to train the model.
+```{r random forest,  cache=TRUE, message = TRUE}
+library(knitr)
+library(caret)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+set.seed(825)
+fit_rf <- train(x2,y, 
+                 method = "rf", 
+                 trControl = fitControl,
+                 verbose = FALSE)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+###Gradient Boosting Machine
+Gradient Boosted Models are also based on classification trees, however in this model weak classifiers are combined together to create better classfication. It is still an ensemble method like Random Forests but with the added advantage of giving more "attention" to features that would have had large error rates if left alone.
+```{r gradient boosting machine,  cache=TRUE}
+library(knitr)
+library(caret)
+library(gbm)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+set.seed(825)
+fit_gbm <- train(x,y,
+                  method="gbm",
+                  trControl = fitControl, 
+                  verbose=FALSE)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+##Evaluating Models
+The final model selected by caret using 10-fold cross validation for each model type is reported below along with the final model's in-sample accuracy and kappa statistic.
+```{r evaluation}
+library(knitr)
+library(caret)
+Model<-c("KNN", "SVM", "NNET", "RF", "GBM")
+Final.Specifications<-c("k=5", "tuning parameter 'C' held constant at a value of 1", "1 layer, 1 neuron and weight decay = 0.1", "28 trees", "150 trees of depth 3 and a learning rate of 0.1")
+Accuracy<-c(max(fit_knn$results$Accuracy), max(fit_svm$results$Accuracy), max(fit_nnet$results$Accuracy), max(fit_rf$results$Accuracy), max(fit_gbm$results$Accuracy))
+Kappa<-c(max(fit_knn$results$Kappa), max(fit_svm$results$Kappa), max(fit_nnet$results$Kappa), max(fit_rf$results$Kappa), max(fit_gbm$results$Kappa))
+kable(cbind(Model, Final.Specifications))
+```
+
+```{r}
+library(tidyr)
+library(ggplot2)
+data<-data.frame(cbind(Model, Accuracy, Kappa))
+data2<-gather(data, key="Attribute", value="Value", c("Accuracy", "Kappa"))
+data2$Value<-as.numeric(data2$Value)
+ggplot(data=data2, aes(x=Model, y=Value, col=Attribute))+geom_jitter(size=3, alpha=0.3, width=0.1)
+```
+
+###Final Decision
+While both the Gradient Boosted and Random Forest Models have high in sample accuracy and high Kappa statistics, the Random Forest model just barely outperforms the Gradient boosted model. The best model for this data, based on both the accuracy, is the Random Forest model and this will be used on the test data. I think the out of sample error will be low due to the use of cross validation. However I still expect the accuracy on new data to be lower than the in sample accuracy of `r max(fit_rf$results$Accuracy)`.
+
+
